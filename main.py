@@ -3,12 +3,81 @@ import ipaddress
 from collections import ChainMap
 
 
-class DeepChainMap(ChainMap):
+class PingProtocolResponse:
 
-    def __setitem__(self, key, value):
-        if key in self.maps[0]:
-            self.maps[0][key + '/1'] = value
-        self.maps[0][key] = value
+    def __init__(self, *, response=None):
+        self.response = response
+
+    def __set__(self, instance, value):
+        if isinstance(value, tuple):
+            count, msg = value
+        for _ in range(count):
+            print(msg)
+
+    def __get__(self, instance, owner):
+        pass
+
+    def __delete__(self, instance):
+        pass
+
+
+class PingProtocol:
+
+    _MAP_MSG_DATAGRAM = {
+        200: '{} replies with success',
+        400: 'Bad request',
+        404: 'host Unreachable',
+        504: 'timeout no route found'
+    }
+
+    response = PingProtocolResponse()
+
+    def ping(self, ip_destination, n=4):
+        try:
+            ipaddress.ip_address(ip_destination)
+        except ValueError:
+            self.response = (
+                4,
+                PingProtocol._make_datagram(400, ipd=ip_destination)
+            )
+            return
+        # table arp search
+        if len(self._arp_cache) == 0:
+            self.response = (
+                4,
+                PingProtocol._make_datagram(504, ipd=ip_destination)
+            )
+
+    def _send(self, other):
+        pass
+
+    def _recv(self, other):
+        if id(self) == id(other):
+            # it is me
+            pass
+
+    @staticmethod
+    def _make_datagram(code, *, ips=None, ipd=None):
+        return PingProtocol._datagram_ip(
+            ips, ipd, PingProtocol._datagram_msg(code, ipd)
+        )
+
+    @staticmethod
+    def _datagram_ip(ip_source, ip_destination, msg):
+        return "from {ips} to {ipd} : {msg}".format(
+            ips=ip_source, ipd=ip_destination,
+            msg=msg
+        )
+
+    @staticmethod
+    def _datagram_msg(code, ip):
+        if code == 200:
+            return PingProtocol._MAP_MSG_DATAGRAM[code].format(ip)
+        return "{}".format(PingProtocol._MAP_MSG_DATAGRAM[code])
+
+
+class DeepChainMap(ChainMap):
+    pass
 
 
 class InterfaceError(Exception):
@@ -31,7 +100,10 @@ class Interface:
 
     @property
     def ip(self):
-        return self.__ip
+        try:
+            return self.__ip
+        except AttributeError:
+            return None
 
     @ip.setter
     def ip(self, value):
@@ -42,7 +114,10 @@ class Interface:
 
     @property
     def mask(self):
-        return self.__mask
+        try:
+            return self.__mask
+        except AttributeError:
+            return None
 
     @mask.setter
     def mask(self, value):
@@ -52,7 +127,10 @@ class Interface:
 
     @property
     def gateway(self):
-        return self.__gateway
+        try:
+            return self.__gateway
+        except AttributeError:
+            return None
 
     @gateway.setter
     def gateway(self, value):
@@ -62,7 +140,7 @@ class Interface:
             raise InterfaceError("{} must be IPv4 address".format(value)) from None
 
 
-class Computer:
+class Computer(PingProtocol):
     def __init__(self, name):
         self.name = name
         self._eths = DeepChainMap()
@@ -71,13 +149,11 @@ class Computer:
     def _set_routes(func):
         def wrapper(self, *args, **kwargs):
             func(self, *args, **kwargs)
-            for k, v in self._eths['']
             if func.__name__ == "set_interface":
-                for i, (_, eth) in enumerate(self._eths.maps[0].items(), start=1):
-                    self._routes.append(
-                        # (instance <interface>, metric)
-                        (i, eth['eth'])
-                    )
+                self._routes.append(
+                    # (metric, instance <interface>)
+                    (len(self._eths.keys()), self._eths[args[0]]['eth'])
+                )
             elif func.__name__ == "del_interface":
                 for i, r in enumerate(self._routes):
                     if r[1]['eth'].name == args[0]:
@@ -87,6 +163,10 @@ class Computer:
 
     @_set_routes
     def set_interface(self, name, interface=None):
+        if name in self._eths.keys():
+            raise InterfaceError(
+                "Interface {} already exists".format(name)
+            )
         if interface is None:
             self._eths[name] = {
                 'connect_to': None,
@@ -119,19 +199,24 @@ class Computer:
         except KeyError:
             pass
 
+    def __getattr__(self, item):
+        if item == "_arp_cache":
+            return self.map_arp()
+        return getattr(self, item)
+
     def map_arp(self):
-        pass
+        return []
 
     def __str__(self):
         if len(self._eths) != 0:
             eths_str = []
             for e, v in self._eths.maps[0].items():
-                eths_str.append("{}: {}/{}".format(v.name, v.ip, v.mask))
+                eths_str.append("{}: {}/{}".format(v['eth'].name, v['eth'].ip, v['eth'].mask))
             return "<{}: {} eths: {}>".format(self.__class__.__name__, self.name, " - ".join(eths_str))
         return "<{}: {}>".format(self.__class__.__name__, self.name)
 
 
-class Switch:
+class Switch(PingProtocol):
     MAX_PORTS = 24
     LABEL_PORT_NAME = "GigaEthernet_"
 
@@ -151,8 +236,8 @@ class Switch:
             self.vlan_id = 1
 
     def __init__(self):
-        self.__ports = [
-            Switch._Interface(Switch.LABEL_PORT_NAME + '_' + str(i)) for i in range(1, Switch.MAX_PORTS + 1)
+        self.__ports = [None] + [
+            Switch._Interface(Switch.LABEL_PORT_NAME + str(i)) for i in range(1, Switch.MAX_PORTS + 1)
         ]
 
     def connect(self, port_number, device, device_name_interface, force=False):
@@ -162,18 +247,16 @@ class Switch:
             ))
         if not isinstance(device, (Computer,)):
             raise SwitchError("Unknown Type of device")
-        if self.__ports[port_number].device is None:
-            self.__ports[port_number].device = device
-            self.__ports[port_number].eth_device = device_name_interface
-            device.connect_eth(device_name_interface, self)
-        else:
+        if self.__ports[port_number].device is not None:
             if not force:
                 raise SwitchError(
                     "{} has already connect to another device".format(self.__ports[port_number].port_name)
                 )
-            self.__ports[port_number].device = device
-            self.__ports[port_number].eth_device = device_name_interface
-            device.connect_eth(device_name_interface, self)
+        self.__ports[port_number].device = device
+        self.__ports[port_number].port_number = port_number
+        self.__ports[port_number].eth_device = device_name_interface
+        device.connect_eth(device_name_interface, self)
+
 
     def disconnect(self, port_number):
         try:
@@ -193,11 +276,15 @@ i.mask = "22"
 i.gateway = "192.168.170.1"
 
 p.set_interface('eth0', i)
-p.set_interface('eth0')
+p.set_interface('eth1')
 
 sw = Switch()
 
 sw.connect(1, p, 'eth0')
+
+print(p)
+
+p.ping("192.168.46.10")
 
 
 
